@@ -86,6 +86,8 @@ parser.add_argument('--guessprobs', action='store_true',
                     help='display guess probs along with guesses')
 parser.add_argument('--complexn', type=int, default=0,
                     help='compute complexity only over top n guesses (0 = all guesses)')
+parser.add_argument('--nhallucinate', type=int, default=2,
+                    help='hallucinate future observations')
 args = parser.parse_args()
 
 # Set the random seed manually for reproducibility.
@@ -320,22 +322,40 @@ def test_evaluate(test_sentences, data_source):
             sent_ids = sent_ids.cuda()
         if (not args.single) and (torch.cuda.device_count() > 1):
             # "module" is necessary when using DataParallel
+            realhidden = model.module.init_hidden(1) # number of parallel sentences being processed
             hidden = model.module.init_hidden(1) # number of parallel sentences being processed
         else:
+            realhidden = model.init_hidden(1) # number of parallel sentences being processed
             hidden = model.init_hidden(1) # number of parallel sentences being processed
         data, targets = test_get_batch(sent_ids, evaluation=True)
         data=data.unsqueeze(1) # only needed if there is just a single sentence being processed
-        output, hidden = model(data, hidden)
-        output_flat = output.view(-1, ntokens)
+        entropies = []
+        for obsix in range(data.size()[0]-args.nhallucinate):
+            entropy = 0
+            realoutput,realhidden = model(data[obsix], realhidden[obsix])
+            output = realoutput
+            hidden = realhidden
+            for hallix in range(args.nhallucinate):
+                output, hidden = model(output, hidden) ## This approach "bulk" hallucinates based on the output embedding rather than a 1-best guess hallucination; not sure this will work
+                entropy += get_entropy(output.view(-1, ntokens))
+            entropies.append(entropy)
+        for corpuspos,targ in enumerate(targets):
+            word = corpus.dictionary.idx2word[int(targ)]
+            if word == '<eos>':
+                #don't output the complexity of EOS
+                continue
+            print(' '.join([str(word),str(i),str(corpuspos),str(len(word)),str(entropies[corpuspos])]))
+            
+        output_flat = realoutput.view(-1, ntokens)
         curr_loss = criterion(output_flat, targets).data
         #curr_loss = len(data) * criterion(output_flat, targets).data # needed if there is more than a single sentence being processed
         total_loss += curr_loss
-        if args.words:
-            # output word-level complexity metrics
-            get_complexity(output_flat,targets,i)
-        else:
+        #if args.words:
+        #    # output word-level complexity metrics
+        #    get_complexity(output_flat,targets,i)
+        #else:
             # output sentence-level loss
-            print(str(sent)+":"+str(curr_loss[0]))
+        #    print(str(sent)+":"+str(curr_loss[0]))
         hidden = repackage_hidden(hidden)
         bar.next()
     bar.finish()
